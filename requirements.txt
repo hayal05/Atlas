@@ -1,8 +1,15 @@
-# AtlasAI has no external dependencies.
-# It only uses Python's standard library:
-#   json, os, difflib, datetime, collections
-#
-# Requires: Python 3.7+
-#
-# This file is included for convention/deployment purposes
-# (e.g. Docker builds, CI pipelines) and can be left empty-effective.
+# ---- Core Web Framework & Server (Required) ----
+flask
+gunicorn
+
+# ---- Database Packages (Optional - uncomment if needed) ----
+# psycopg2-binary          # Required if you are connecting to a PostgreSQL database
+# Flask-SQLAlchemy         # Simplifies database models for Flask
+
+# ---- Utilities & Environment (Optional but highly recommended) ----
+python-dotenv            # Automatically loads environment variables from a .env file
+requests                 # Allows your app to make HTTP requests to external APIs
+
+# ---- Frontend & Security (Optional) ----
+# Flask-Cors               # Enables Cross-Origin Resource Sharing (useful for React/frontend APIs)
+# Flask-Bcrypt             # Helps with secure password hashing for user accounts
