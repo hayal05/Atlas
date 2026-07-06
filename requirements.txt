@@ -1,0 +1,8 @@
+# AtlasAI has no external dependencies.
+# It only uses Python's standard library:
+#   json, os, difflib, datetime, collections
+#
+# Requires: Python 3.7+
+#
+# This file is included for convention/deployment purposes
+# (e.g. Docker builds, CI pipelines) and can be left empty-effective.
