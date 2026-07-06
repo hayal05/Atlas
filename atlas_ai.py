@@ -265,118 +265,97 @@ class AtlasAI:
 # Simple CLI (menu-driven) so the tool is usable end-to-end
 # ---------------------------------------------------------------------------
 
-def admin_panel(atlas: AtlasAI):
-    pwd = input("Enter admin password: ").strip()
-    if pwd != ADMIN_PASSWORD:
-        print("Incorrect password.\n")
-        return
+# ---------------------------------------------------------------------------
+# Full Web API Configuration (Handles Employee Mode & Admin Panel)
+# ---------------------------------------------------------------------------
 
-    while True:
-        print("\n--- AtlasAI Admin Panel ---")
-        print("1. Add document (Google Drive link)")
-        print("2. List documents")
-        print("3. Remove document")
-        print("4. Teach a new FAQ answer")
-        print("5. List learned FAQ")
-        print("6. Remove FAQ entry")
-        print("7. View usage report")
-        print("8. Back to main menu")
-        choice = input("Choose an option: ").strip()
+from flask import Flask, request, jsonify
 
-        if choice == "1":
-            title = input("Document title: ").strip()
-            link = input("Google Drive link: ").strip()
-            tags = input("Tags/keywords (comma separated, optional): ").strip()
-            doc = atlas.add_document(title, link, tags)
-            print(f"Added document #{doc['id']}: {doc['title']}")
+app = Flask(__name__)
+atlas = AtlasAI()
 
-        elif choice == "2":
-            docs = atlas.list_documents()
-            if not docs:
-                print("No documents registered yet.")
-            for d in docs:
-                print(f"[{d['id']}] {d['title']} -> {d['drive_link']} (tags: {', '.join(d['tags']) or '-'})")
-
-        elif choice == "3":
-            try:
-                doc_id = int(input("Document ID to remove: ").strip())
-                print("Removed." if atlas.remove_document(doc_id) else "Document not found.")
-            except ValueError:
-                print("Please enter a valid numeric ID.")
-
-        elif choice == "4":
-            q = input("Question: ").strip()
-            a = input("Answer: ").strip()
-            atlas.teach_faq(q, a)
-            print("FAQ learned.")
-
-        elif choice == "5":
-            faq = atlas.list_faq()
-            if not faq:
-                print("No FAQ entries yet.")
-            for i, entry in enumerate(faq):
-                print(f"[{i}] Q: {entry['question']}  ->  A: {entry['answer']}  (used {entry['times_used']}x)")
-
-        elif choice == "6":
-            try:
-                idx = int(input("FAQ index to remove: ").strip())
-                print("Removed." if atlas.remove_faq(idx) else "Index not found.")
-            except ValueError:
-                print("Please enter a valid numeric index.")
-
-        elif choice == "7":
-            atlas.print_usage_report()
-
-        elif choice == "8":
-            break
-        else:
-            print("Invalid option, try again.")
+# --- Employee Route ---
+@app.route("/ask", methods=["POST"])
+def ask_atlas():
+    data = request.json or {}
+    question = data.get("question", "").strip()
+    user = data.get("user", "employee")
+    
+    if not question:
+        return jsonify({"error": "Question is required"}), 400
+        
+    result = atlas.ask(question, user=user)
+    return jsonify(result)
 
 
-def employee_mode(atlas: AtlasAI):
-    user = input("Enter your name (for usage tracking): ").strip() or "employee"
-    print("\nAsk AtlasAI anything about company documents. Type 'exit' to return to the main menu.\n")
-    while True:
-        question = input(f"{user} > ").strip()
-        if question.lower() in ("exit", "quit"):
-            break
-        if not question:
-            continue
+# --- Admin Panel Routes ---
 
-        result = atlas.ask(question, user=user)
-        print(f"AtlasAI: {result['answer']}")
+@app.route("/admin/documents", methods=["GET", "POST", "DELETE"])
+def manage_documents():
+    # Quick password check for admin security
+    password = request.headers.get("Authorization")
+    if password != ADMIN_PASSWORD:
+        return jsonify({"error": "Unauthorized"}), 401
 
-        if result["source"] == "unanswered":
-            teach = input("  (Optional) Provide the correct answer to teach AtlasAI now, or press Enter to skip: ").strip()
-            if teach:
-                atlas.teach_faq(question, teach)
-                print("  Thanks! AtlasAI has learned this for next time.")
-        print()
+    if request.method == "GET":
+        return jsonify(atlas.list_documents())
+
+    elif request.method == "POST":
+        data = request.json or {}
+        title = data.get("title", "").strip()
+        link = data.get("drive_link", "").strip()
+        tags = data.get("tags", "")
+        if not title or not link:
+            return jsonify({"error": "Title and drive_link are required"}), 400
+        doc = atlas.add_document(title, link, tags)
+        return jsonify({"message": "Document added successfully", "document": doc})
+
+    elif request.method == "DELETE":
+        data = request.json or {}
+        doc_id = data.get("doc_id")
+        if not doc_id:
+            return jsonify({"error": "doc_id is required"}), 400
+        if atlas.remove_document(int(doc_id)):
+            return jsonify({"message": "Document removed successfully"})
+        return jsonify({"error": "Document not found"}), 404
 
 
-def main():
-    atlas = AtlasAI()
-    print("=====================================")
-    print("            Welcome to AtlasAI        ")
-    print("  Your organization's document assistant")
-    print("=====================================")
+@app.route("/admin/faq", methods=["GET", "POST", "DELETE"])
+def manage_faq():
+    password = request.headers.get("Authorization")
+    if password != ADMIN_PASSWORD:
+        return jsonify({"error": "Unauthorized"}), 401
 
-    while True:
-        print("\n1. Ask AtlasAI a question (Employee mode)")
-        print("2. Admin Panel")
-        print("3. Exit")
-        choice = input("Choose an option: ").strip()
+    if request.method == "GET":
+        return jsonify(atlas.list_faq())
 
-        if choice == "1":
-            employee_mode(atlas)
-        elif choice == "2":
-            admin_panel(atlas)
-        elif choice == "3":
-            print("Goodbye!")
-            break
-        else:
-            print("Invalid option, try again.")
+    elif request.method == "POST":
+        data = request.json or {}
+        question = data.get("question", "").strip()
+        answer = data.get("answer", "").strip()
+        if not question or not answer:
+            return jsonify({"error": "Question and answer are required"}), 400
+        entry = atlas.teach_faq(question, answer)
+        return jsonify({"message": "FAQ entry learned successfully", "entry": entry})
+
+    elif request.method == "DELETE":
+        data = request.json or {}
+        index = data.get("index")
+        if index is None:
+            return jsonify({"error": "Index is required"}), 400
+        if atlas.remove_faq(int(index)):
+            return jsonify({"message": "FAQ entry removed successfully"})
+        return jsonify({"error": "Index not found"}), 404
+
+
+@app.route("/admin/report", methods=["GET"])
+def get_report():
+    password = request.headers.get("Authorization")
+    if password != ADMIN_PASSWORD:
+        return jsonify({"error": "Unauthorized"}), 401
+        
+    return jsonify(atlas.usage_report())
 
 
 if __name__ == "__main__":
-    main()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
