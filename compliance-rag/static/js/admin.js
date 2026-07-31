@@ -121,4 +121,17 @@ dropzone.addEventListener('drop', e => {
   if (file) uploadFile(file);
 });
 
+(async function loadGeneralQaStatus() {
+  const el = document.getElementById('generalQaStatus');
+  try {
+    const res = await fetch('/api/health');
+    const data = await res.json();
+    el.textContent = data.general_qa_enabled
+      ? 'Enabled — off-document questions are answered from general knowledge, clearly labeled.'
+      : 'Disabled — off-document questions get a "check with compliance" message instead.';
+  } catch (e) {
+    el.textContent = 'Could not reach the health endpoint to check status.';
+  }
+})();
+
 if (token) showMain(); else showGate();
