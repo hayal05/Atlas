@@ -231,7 +231,7 @@ class ComplianceIndex:
             rows = conn.execute(
                 """
                 SELECT chunk_id, source, heading, chunk_number, page, text,
-                       embedding <=> %s AS distance
+                       embedding <=> %s::vector AS distance
                 FROM chunks
                 ORDER BY distance
                 LIMIT %s
