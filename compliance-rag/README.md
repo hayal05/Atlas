@@ -63,21 +63,13 @@ see "Admin: uploading documents" below.
      now does it fall back to general knowledge, or refuse — see below.
 4. Grounded excerpts (either tier) are handed to an open source LLM with
    instructions to answer *only* from the provided text and cite the
-   source section inline. After the model responds, the backend appends a
-   **References** section itself — not written by the model, so it can't
-   be misquoted — listing, per excerpt actually used: document name, page
-   number (if applicable), section heading, and content number, e.g.:
-
-   ```
-   ---
-   References
-   1. expense_policy.md — § Section 4.2 (content #5)
-   2. data_handling_policy.pdf — page 3, § General (content #2)
-   ```
-
-   The same detail (source, page, content number, relevance score) is
-   also returned structurally in the API's `citations` array and shown as
-   chips under the answer in the UI.
+   source section inline (e.g. "(Expense Policy, Section 4.2)"). The
+   backend separately returns a deduplicated, structured `citations` list
+   — document name, section heading, and page number where applicable —
+   built in code from the retrieved chunks, not left to the model, so it
+   can't be misquoted. This is the single source of truth for references
+   and is what renders as chips under the answer in the UI; there's no
+   second copy of the same list appended as text.
 5. If nothing clears even the weak-match bar, and `ALLOW_GENERAL_QA=true`
    (the default), Atlas AI answers from the model's general knowledge
    instead of refusing outright — clearly labeled in the UI ("General
@@ -133,7 +125,8 @@ python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 
 cp .env.example .env
-# edit .env: at minimum set LLM_API_KEY (a free Groq key works well)
+# edit .env: set LLM_API_KEY (a free Groq key works well) and DATABASE_URL
+# (a free Neon project works well: https://neon.tech -- see below)
 export $(cat .env | grep -v '^#' | xargs)
 
 uvicorn app.main:app --reload
@@ -142,66 +135,79 @@ uvicorn app.main:app --reload
 Visit `http://localhost:8000` for the assistant, or `http://localhost:8000/admin`
 to upload documents (see below).
 
-Two sample policies in `data/docs/` are copied into the live, writable
-`DOCS_DIR` the first time the app starts, so it works out of the box.
-From then on, manage documents either by dropping files directly into
-`DOCS_DIR` and restarting, or through the `/admin` upload page — no
-restart needed for uploads made that way.
+Two sample policies in `data/docs/` are copied into the `documents` table
+in your Neon database the first time the app starts, so it works out of
+the box. From then on, manage documents through the `/admin` upload
+page — uploads and deletes are written straight to Neon and take effect
+immediately, no restart needed.
 
 ## Deploying to Render
 
 This repo includes a `render.yaml`, so the easiest path is Render's
 **Blueprint** deploy:
 
-1. Push this repo to GitHub/GitLab.
-2. In Render, choose **New > Blueprint** and point it at the repo.
-3. Render will read `render.yaml` and provision a web service with a
-   1GB persistent disk (for the Chroma index).
-4. Set the `LLM_API_KEY` environment variable in the Render dashboard
-   (it's marked `sync: false` in the blueprint so it's never committed).
-5. Deploy. On first boot the app indexes everything in `data/docs/`.
+1. Create a free Neon project at https://neon.tech and copy its connection
+   string (Project -> Connect). It looks like
+   `postgresql://user:password@ep-xxxx.neon.tech/dbname?sslmode=require`.
+   Neon's pgvector extension is enabled automatically by the app on
+   startup (`CREATE EXTENSION IF NOT EXISTS vector`) — nothing to do by
+   hand in the Neon console.
+2. Push this repo to GitHub/GitLab.
+3. In Render, choose **New > Blueprint** and point it at the repo.
+4. Render will read `render.yaml` and provision a web service — no disk
+   needed, since documents and the vector index both live in Neon now.
+5. Set `LLM_API_KEY` and `DATABASE_URL` in the Render dashboard (both are
+   marked `sync: false` in the blueprint so neither is ever committed).
+6. Deploy. On first boot the app seeds `data/docs/` into Neon (only if
+   the `documents` table is empty) and builds the index from there.
 
 If you'd rather configure manually instead of using the blueprint:
 Runtime = Python 3, Build command = `pip install -r requirements.txt`,
 Start command = `uvicorn app.main:app --host 0.0.0.0 --port $PORT`.
 
-### About the persistent disk
+### Why redeploys no longer erase anything
 
-Render's filesystem is ephemeral on redeploys unless you attach a disk
-(the blueprint does this). The index also fully rebuilds from
-`data/docs/` on every startup regardless, so the disk is a nice-to-have
-for warm restarts, not a hard requirement — if you'd rather keep the
-service disk-free, remove the `disk:` block from `render.yaml` and set
-`CHROMA_DIR` to a temp path.
+Render's local filesystem is wiped on every redeploy, restart, and
+instance move. Earlier versions of this app stored uploaded documents
+and the Chroma vector index on that filesystem (optionally backed by a
+Render persistent disk), so anything uploaded through `/admin` could be
+lost the moment the disk config changed or the service moved instances.
+
+Now both live in Neon Postgres instead: uploaded file bytes go in a
+`documents` table, and chunk embeddings go in a `chunks` table using the
+`pgvector` extension, queried with a plain `ORDER BY embedding <=> ...`
+similarity search. Neon is external to Render entirely, so none of it is touched by a
+redeploy — a redeploy just reconnects to the same database. There's no
+in-memory index either; every `/api/ask` query runs its similarity
+search directly against the `chunks` table in Neon. The one thing that
+still happens on every startup is `index.rebuild()`, which re-chunks and
+re-embeds all documents already in Neon — cheap, and it means a code
+change to chunking/embedding takes effect on the next deploy without a
+manual reindex.
 
 ### Running on Render's free tier
 
-`render.yaml` as shipped uses `plan: starter` plus a persistent disk, since
-free-tier web services don't support attached disks at all. To run on the
-free tier instead:
+`render.yaml` as shipped uses `plan: starter`. To run on the free tier
+instead, change `plan: starter` to `plan: free` — no other change is
+needed, since storage no longer depends on a Render disk. Know the other
+trade-offs that come with the free tier:
 
-1. In `render.yaml`, change `plan: starter` to `plan: free` and delete the
-   whole `disk:` block.
-2. Set `CHROMA_DIR` (or just leave `PERSIST_ROOT`/`DOCS_DIR` at their
-   defaults) to a path under the app's own ephemeral filesystem, e.g.
-   `./local_data` — there's no mounted disk to point it at anymore.
-3. Know the trade-offs that come with the free tier:
-   - **No persistent disk** — any documents uploaded via `/admin` are lost
-     on every restart/redeploy; only what's checked into `data/docs/` comes
-     back automatically. Re-upload after a redeploy, or commit real policy
-     docs to `data/docs/` instead of relying on admin uploads.
-   - **Spins down after ~15 minutes idle** — the first request after that
-     triggers a cold start (service boot + re-indexing `data/docs/`), which
-     can take a while depending on how much you've indexed.
-   - **Single instance, limited CPU/RAM (512MB)** — this is why generation
-     is offloaded to an external LLM host (see above) rather than
-     self-hosted, and why `LLM_TIMEOUT_SECONDS`/`LLM_MAX_TOKENS` exist: one
-     slow request shouldn't be able to block the only worker for other
-     users.
+- **Spins down after ~15 minutes idle** — the first request after that
+  triggers a cold start (service boot + reconnect to Neon + re-embedding
+  whatever's indexed), which can take a while depending on how much
+  you've indexed.
+- **Single instance, limited CPU/RAM (512MB)** — this is why generation
+  is offloaded to an external LLM host (see above) rather than
+  self-hosted, and why `LLM_TIMEOUT_SECONDS`/`LLM_MAX_TOKENS` exist: one
+  slow request shouldn't be able to block the only worker for other
+  users.
+- **Neon's own free-tier limits** — free Neon projects auto-suspend
+  after inactivity too, and have storage/compute caps of their own;
+  check the current limits at https://neon.tech/docs if you expect real
+  traffic.
 
 Everything else in this README (admin uploads, the general Q&A fallback,
-etc.) works the same on free as on Starter — the only difference is disk
-persistence.
+etc.) works the same on free as on Starter.
 
 ### If the deploy fails with "Exited with status 137"
 
@@ -210,11 +216,12 @@ That exit code means the process was killed for using too much memory
 also see Render logging "No open ports detected" right before it.
 
 This app is built to avoid that: embeddings run through Chroma's
-built-in ONNX MiniLM function rather than `sentence-transformers`/torch,
-which keeps the memory footprint small enough for Render's Starter
-plan (512MB). If you've since added a heavier dependency (a bigger
-local model, `torch`, etc.) and hit this again, either trim that
-dependency or move to a plan with more RAM.
+built-in ONNX MiniLM function rather than `sentence-transformers`/torch
+(the vectors themselves are stored in Neon via pgvector, not in Chroma),
+which keeps the memory footprint small enough for Render's Starter plan
+(512MB). If you've since added a heavier dependency (a bigger local
+model, `torch`, etc.) and hit this again, either trim that dependency or
+move to a plan with more RAM.
 
 ## Admin: uploading documents
 
@@ -237,10 +244,10 @@ trails of *who* uploaded what, or SSO, put this behind your normal
 company auth (e.g. an internal reverse proxy or a proper auth
 middleware) instead of relying on the token alone.
 
-Uploaded documents are stored on the persistent disk (`DOCS_DIR`), so
-they survive redeploys. The two sample policies are copied there once
-on first boot and are otherwise ordinary documents — an admin can
-delete or replace them like anything else.
+Uploaded documents are stored in Neon (the `documents` table), so they
+survive redeploys, restarts, and instance moves. The two sample policies
+are copied there once on first boot and are otherwise ordinary
+documents — an admin can delete or replace them like anything else.
 
 PDF and DOCX are converted to text on upload (page-by-page for PDFs,
 heading-aware for DOCX) so retrieval and citations work the same way
@@ -257,14 +264,16 @@ as for markdown source files.
     `"general"` (no document match, answered from general knowledge,
     `grounded: false`), or `"unavailable"` (no match and the fallback is
     disabled or failed, `grounded: false`)
-  - `citations` is a list of `{source, heading, page, chunk_number,
-    relevance}` for every excerpt used — `page` is `null` when the format/
-    file has no page concept (markdown, `.txt`, or a DOCX with no explicit
-    page breaks)
-  - `answer` includes an appended `References` section (document name,
-    page if applicable, section, content number) for `grounded` and
-    `grounded_partial` responses, built deterministically from the same
-    metadata as `citations` — not left to the model to phrase
+  - `citations` is a deduplicated list of `{source, heading, page}` for
+    every document section actually used — `page` is `null` when the
+    format/file has no page concept (markdown, `.txt`, or a DOCX with no
+    explicit page breaks). Internal retrieval bookkeeping (chunk number,
+    raw similarity score) isn't included; confidence is already conveyed
+    by `mode`.
+  - `answer` is just the model's text with inline citations (e.g.
+    "(Expense Policy, Section 4.2)") — no separate appended reference
+    list, since `citations` already covers that structurally without
+    duplicating it as text
 - `GET /api/admin/documents` — list indexed documents *(requires `X-Admin-Token`)*
 - `POST /api/admin/documents` — upload a document, multipart `file=` field *(requires `X-Admin-Token`)*
 - `DELETE /api/admin/documents/{filename}` — remove a document *(requires `X-Admin-Token`)*
