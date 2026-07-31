@@ -227,8 +227,8 @@ form.addEventListener('submit', async (e) => {
     let html = (MODE_BADGE[mode] || '') + renderAnswer(data.answer);
     if (data.citations && data.citations.length) {
       html += '<div class="citations">' + data.citations.map(c => {
-        const loc = (c.page ? `p.${c.page} · ` : '') + `#${c.chunk_number}`;
-        return `<span class="citation"><b>${escapeHtml(c.source)}</b> · ${escapeHtml(c.heading)} · ${loc} (${c.relevance})</span>`;
+        const loc = c.page ? `p.${c.page} · ` : '';
+        return `<span class="citation"><b>${escapeHtml(c.source)}</b> · ${loc}${escapeHtml(c.heading)}</span>`;
       }).join('') + '</div>';
     }
     thinking.querySelector('.bubble').innerHTML = html;
