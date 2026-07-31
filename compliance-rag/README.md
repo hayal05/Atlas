@@ -39,17 +39,71 @@ see "Admin: uploading documents" below.
 ## How it works
 
 1. Policy documents in `data/docs/` (markdown, `.txt`, `.pdf`, `.docx`) are
-   chunked by section on startup.
+   split by page (real pages for PDF; detected page breaks for DOCX; no
+   page concept for markdown/txt), then chunked by section within each
+   page on startup. Every chunk keeps its source filename, page number
+   (if any), section heading, and a sequential **content number** — its
+   1-based position among that document's chunks — so any excerpt can be
+   pointed back to precisely.
 2. Chunks are embedded locally with Chroma's built-in ONNX MiniLM embedding
    function — no API key needed, runs on CPU, and has no torch/transformers
    dependency, which keeps this comfortably inside low-memory hosting tiers
    — and stored in a persistent Chroma vector index.
 3. A question is embedded the same way and matched against the index to
-   pull back the most relevant chunks.
-4. Those chunks (not the raw question alone) are handed to an open source
-   LLM with instructions to answer *only* from the provided text and cite
-   the source section. If nothing relevant is found, it says so instead
-   of guessing.
+   pull back the most relevant chunks. **Uploaded documents always get
+   first crack at answering** — general knowledge is only ever a
+   fallback, in two tiers:
+   - **Confident match** (`score >= MIN_RELEVANCE`) → answered from those
+     excerpts, `mode: "grounded"`.
+   - **Weak match** (`SOFT_RELEVANCE <= score < MIN_RELEVANCE`) → still a
+     *document* match, just a shakier one, so it's still preferred over
+     general knowledge — answered from those excerpts with an explicit
+     "this is only a partial match" note, `mode: "grounded_partial"`.
+   - **No match at all** (`score < SOFT_RELEVANCE` for everything) → only
+     now does it fall back to general knowledge, or refuse — see below.
+4. Grounded excerpts (either tier) are handed to an open source LLM with
+   instructions to answer *only* from the provided text and cite the
+   source section inline. After the model responds, the backend appends a
+   **References** section itself — not written by the model, so it can't
+   be misquoted — listing, per excerpt actually used: document name, page
+   number (if applicable), section heading, and content number, e.g.:
+
+   ```
+   ---
+   References
+   1. expense_policy.md — § Section 4.2 (content #5)
+   2. data_handling_policy.pdf — page 3, § General (content #2)
+   ```
+
+   The same detail (source, page, content number, relevance score) is
+   also returned structurally in the API's `citations` array and shown as
+   chips under the answer in the UI.
+5. If nothing clears even the weak-match bar, and `ALLOW_GENERAL_QA=true`
+   (the default), Atlas AI answers from the model's general knowledge
+   instead of refusing outright — clearly labeled in the UI ("General
+   knowledge · not from your policy documents") and in the API response
+   (`mode: "general"`, `grounded: false`) so it's never mistaken for
+   documented policy. Set `ALLOW_GENERAL_QA=false` to go back to the
+   original strict, docs-only behavior (a message pointing the person to
+   their compliance officer).
+
+   This fallback reuses the *same* external LLM host already configured
+   for grounded answers, so it costs one extra outbound API call, not one
+   extra process or model — it doesn't change the service's memory
+   footprint, which matters if you're on Render's free tier (see below).
+   `LLM_TIMEOUT_SECONDS` and `LLM_MAX_TOKENS` cap how long/large any single
+   LLM call can be, so a slow or oversized response can't tie up the
+   service's only worker.
+
+### A note on DOCX page numbers
+
+PDF page numbers are exact (pypdf reads real pages). DOCX has no stored
+page count — pagination is a rendering detail — so page numbers for DOCX
+are only recovered when the author inserted explicit page breaks
+(Ctrl+Enter in Word); Atlas AI detects those and numbers accordingly. A
+DOCX with no explicit breaks (e.g. relying on Word's automatic reflow) has
+no page numbers to cite, so its citations show section heading and
+content number only, no page — same as markdown/`.txt`.
 
 ## Why the LLM call goes to an external endpoint
 
@@ -120,6 +174,35 @@ for warm restarts, not a hard requirement — if you'd rather keep the
 service disk-free, remove the `disk:` block from `render.yaml` and set
 `CHROMA_DIR` to a temp path.
 
+### Running on Render's free tier
+
+`render.yaml` as shipped uses `plan: starter` plus a persistent disk, since
+free-tier web services don't support attached disks at all. To run on the
+free tier instead:
+
+1. In `render.yaml`, change `plan: starter` to `plan: free` and delete the
+   whole `disk:` block.
+2. Set `CHROMA_DIR` (or just leave `PERSIST_ROOT`/`DOCS_DIR` at their
+   defaults) to a path under the app's own ephemeral filesystem, e.g.
+   `./local_data` — there's no mounted disk to point it at anymore.
+3. Know the trade-offs that come with the free tier:
+   - **No persistent disk** — any documents uploaded via `/admin` are lost
+     on every restart/redeploy; only what's checked into `data/docs/` comes
+     back automatically. Re-upload after a redeploy, or commit real policy
+     docs to `data/docs/` instead of relying on admin uploads.
+   - **Spins down after ~15 minutes idle** — the first request after that
+     triggers a cold start (service boot + re-indexing `data/docs/`), which
+     can take a while depending on how much you've indexed.
+   - **Single instance, limited CPU/RAM (512MB)** — this is why generation
+     is offloaded to an external LLM host (see above) rather than
+     self-hosted, and why `LLM_TIMEOUT_SECONDS`/`LLM_MAX_TOKENS` exist: one
+     slow request shouldn't be able to block the only worker for other
+     users.
+
+Everything else in this README (admin uploads, the general Q&A fallback,
+etc.) works the same on free as on Starter — the only difference is disk
+persistence.
+
 ### If the deploy fails with "Exited with status 137"
 
 That exit code means the process was killed for using too much memory
@@ -165,8 +248,23 @@ as for markdown source files.
 
 ## API
 
-- `GET /api/health` — status and indexed chunk count
-- `POST /api/ask` — `{"question": "..."}` → grounded answer + citations
+- `GET /api/health` — status, indexed chunk count, and whether the general
+  Q&A fallback is enabled (`general_qa_enabled`)
+- `POST /api/ask` — `{"question": "...", "top_k": 5}` → `{"answer", "citations",
+  "grounded", "mode"}`, where:
+  - `mode` is `"grounded"` (confident document match), `"grounded_partial"`
+    (weaker document match, still preferred over general knowledge),
+    `"general"` (no document match, answered from general knowledge,
+    `grounded: false`), or `"unavailable"` (no match and the fallback is
+    disabled or failed, `grounded: false`)
+  - `citations` is a list of `{source, heading, page, chunk_number,
+    relevance}` for every excerpt used — `page` is `null` when the format/
+    file has no page concept (markdown, `.txt`, or a DOCX with no explicit
+    page breaks)
+  - `answer` includes an appended `References` section (document name,
+    page if applicable, section, content number) for `grounded` and
+    `grounded_partial` responses, built deterministically from the same
+    metadata as `citations` — not left to the model to phrase
 - `GET /api/admin/documents` — list indexed documents *(requires `X-Admin-Token`)*
 - `POST /api/admin/documents` — upload a document, multipart `file=` field *(requires `X-Admin-Token`)*
 - `DELETE /api/admin/documents/{filename}` — remove a document *(requires `X-Admin-Token`)*
