@@ -86,7 +86,11 @@ async function uploadFile(file) {
     }
     setStatus(`Uploaded ${file.name}.`, false);
     loadDocuments();
-  } catch (e) {}
+  } catch (e) {
+    if (e.message !== 'unauthorized') {
+      setStatus(`Upload failed: ${e.message || 'network error, please retry.'}`, true);
+    }
+  }
 }
 
 function escapeHtml(s) {
