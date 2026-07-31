@@ -148,7 +148,28 @@ def _citations_for(chunks) -> List[Citation]:
 
 @app.post("/api/ask", response_model=AskResponse)
 def ask(req: AskRequest):
-    retrieved = index.retrieve(req.question, top_k=req.top_k)
+    try:
+        retrieved = index.retrieve(req.question, top_k=req.top_k)
+    except Exception:
+        # A DB hiccup (Neon waking from idle-suspend, a pool timeout, a
+        # dropped connection, etc.) shouldn't surface as a bare 500 --
+        # that comes back as non-JSON to the browser and breaks the
+        # frontend's res.json() parsing, which is exactly what made this
+        # indistinguishable from a generic "network error" client-side.
+        # Log it so the real cause is visible in the server logs, and
+        # return the same honest, well-formed "unavailable" response the
+        # general-Q&A fallback already uses on its own failures.
+        logger.exception("Retrieval failed for question: %r", req.question)
+        return AskResponse(
+            answer=(
+                "I couldn't reach the procedure document index just now (this is "
+                "usually a temporary database connection issue). Please try again "
+                "in a moment, or check with your compliance officer if it persists."
+            ),
+            citations=[],
+            grounded=False,
+            mode="unavailable",
+        )
 
     # Tier 1: confident document match -- uploaded documents always get
     # first crack at answering. Tier 2: no confident match, but a weaker
