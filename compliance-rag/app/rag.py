@@ -12,13 +12,13 @@ import glob
 import os
 import re
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 import chromadb
 from chromadb.utils import embedding_functions
 
 from app.config import settings
-from app.extract import extract_text, ALLOWED_EXTENSIONS
+from app.extract import extract_pages, ALLOWED_EXTENSIONS
 
 
 @dataclass
@@ -27,6 +27,8 @@ class Chunk:
     source: str
     heading: str
     chunk_id: str
+    page: Optional[int] = None  # 1-based page number if the format has pages, else None
+    chunk_number: int = 0     # 1-based position of this chunk within its source document
 
 
 @dataclass
@@ -79,22 +81,30 @@ def load_and_chunk_documents(docs_dir: str) -> List[Chunk]:
     )
     for path in paths:
         try:
-            text = extract_text(path)
+            pages = extract_pages(path)
         except Exception as e:
             print(f"[ingest] skipping {path}: {e}")
             continue
         source_name = os.path.relpath(path, docs_dir)
-        sections = _split_into_sections(text) or [("General", text)]
-        for heading, body in sections:
-            for i, piece in enumerate(_chunk_section(body, settings.CHUNK_SIZE, settings.CHUNK_OVERLAP)):
-                chunks.append(
-                    Chunk(
-                        text=piece.strip(),
-                        source=source_name,
-                        heading=heading,
-                        chunk_id=f"{source_name}::{heading}::{i}",
+        chunk_number = 0  # 1-based position of a chunk within this source doc, for citations
+        for page_num, page_text in pages:
+            sections = _split_into_sections(page_text) or [("General", page_text)]
+            for heading, body in sections:
+                for piece in _chunk_section(body, settings.CHUNK_SIZE, settings.CHUNK_OVERLAP):
+                    piece = piece.strip()
+                    if not piece:
+                        continue
+                    chunk_number += 1
+                    chunks.append(
+                        Chunk(
+                            text=piece,
+                            source=source_name,
+                            heading=heading,
+                            chunk_id=f"{source_name}::p{page_num}::{heading}::{chunk_number}",
+                            page=page_num,
+                            chunk_number=chunk_number,
+                        )
                     )
-                )
     return chunks
 
 
@@ -184,7 +194,16 @@ class ComplianceIndex:
         self._collection.add(
             ids=[c.chunk_id for c in chunks],
             documents=[c.text for c in chunks],
-            metadatas=[{"source": c.source, "heading": c.heading} for c in chunks],
+            metadatas=[
+                {
+                    "source": c.source,
+                    "heading": c.heading,
+                    "chunk_number": c.chunk_number,
+                    # Chroma metadata can't store None, so use 0 as "no page"
+                    "page": c.page if c.page is not None else 0,
+                }
+                for c in chunks
+            ],
         )
         return len(chunks)
 
@@ -205,9 +224,17 @@ class ComplianceIndex:
         for doc, meta, dist, cid in zip(docs, metas, dists, ids):
             # Chroma cosine "distance" -> similarity score in [0, 1]
             similarity = max(0.0, 1.0 - dist / 2.0)
+            page = meta.get("page") or None  # 0 was stored as "no page" -> None
             out.append(
                 RetrievedChunk(
-                    chunk=Chunk(text=doc, source=meta["source"], heading=meta["heading"], chunk_id=cid),
+                    chunk=Chunk(
+                        text=doc,
+                        source=meta["source"],
+                        heading=meta["heading"],
+                        chunk_id=cid,
+                        page=page,
+                        chunk_number=meta.get("chunk_number", 0),
+                    ),
                     score=similarity,
                 )
             )

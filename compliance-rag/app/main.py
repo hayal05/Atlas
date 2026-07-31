@@ -15,7 +15,7 @@ from app.rag import (
     save_uploaded_document,
     delete_document,
 )
-from app.llm import answer_question
+from app.llm import answer_question, answer_general_question
 
 templates = Jinja2Templates(directory="templates")
 
@@ -57,17 +57,30 @@ class Citation(BaseModel):
     source: str
     heading: str
     relevance: float
+    page: Optional[int] = None
+    chunk_number: int = 0
 
 
 class AskResponse(BaseModel):
     answer: str
     citations: List[Citation]
     grounded: bool
+    # "grounded": confident match against indexed procedure documents
+    # "grounded_partial": only a weak document match -- still prioritized
+    #                     over general knowledge, but flagged as weaker
+    # "general": no matching document, answered from the model's general
+    #            knowledge instead, clearly labeled as such
+    # "unavailable": no matching document and general Q&A is disabled/failed
+    mode: str = "grounded"
 
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "indexed_chunks": index.count()}
+    return {
+        "status": "ok",
+        "indexed_chunks": index.count(),
+        "general_qa_enabled": settings.ALLOW_GENERAL_QA,
+    }
 
 
 @app.get("/api/admin/documents")
@@ -106,28 +119,69 @@ def admin_reindex(_: None = Depends(require_admin)):
     return {"indexed_chunks": n}
 
 
+def _citations_for(chunks) -> List[Citation]:
+    return [
+        Citation(
+            source=r.chunk.source,
+            heading=r.chunk.heading,
+            relevance=round(r.score, 3),
+            page=r.chunk.page,
+            chunk_number=r.chunk.chunk_number,
+        )
+        for r in chunks
+    ]
+
+
 @app.post("/api/ask", response_model=AskResponse)
 def ask(req: AskRequest):
     retrieved = index.retrieve(req.question, top_k=req.top_k)
-    relevant = [r for r in retrieved if r.score >= settings.MIN_RELEVANCE]
 
-    if not relevant:
-        return AskResponse(
-            answer=(
-                "I couldn't find procedure documentation that clearly covers this "
-                "question. Please check with your compliance officer or the relevant "
-                "policy owner directly, or rephrase the question."
-            ),
-            citations=[],
-            grounded=False,
-        )
+    # Tier 1: confident document match -- uploaded documents always get
+    # first crack at answering. Tier 2: no confident match, but a weaker
+    # one -- still a document, and still preferred over general knowledge.
+    # Only when neither tier finds anything does the assistant fall
+    # through to general knowledge (or refuse).
+    strong = [r for r in retrieved if r.score >= settings.MIN_RELEVANCE]
+    weak = [r for r in retrieved if settings.SOFT_RELEVANCE <= r.score < settings.MIN_RELEVANCE]
 
-    answer = answer_question(req.question, relevant)
-    citations = [
-        Citation(source=r.chunk.source, heading=r.chunk.heading, relevance=round(r.score, 3))
-        for r in relevant
-    ]
-    return AskResponse(answer=answer, citations=citations, grounded=True)
+    if strong:
+        answer = answer_question(req.question, strong)
+        return AskResponse(answer=answer, citations=_citations_for(strong), grounded=True, mode="grounded")
+
+    if weak:
+        answer = answer_question(req.question, weak, weak_match=True)
+        return AskResponse(answer=answer, citations=_citations_for(weak), grounded=True, mode="grounded_partial")
+
+    if settings.ALLOW_GENERAL_QA:
+        try:
+            answer = answer_general_question(req.question)
+        except Exception:
+            # An LLM host hiccup (timeout, rate limit, etc.) shouldn't
+            # surface as a 500 -- fall back to the same honest refusal
+            # as when general Q&A is disabled.
+            return AskResponse(
+                answer=(
+                    "I couldn't find procedure documentation covering this question, "
+                    "and the general-knowledge fallback is temporarily unavailable. "
+                    "Please try again shortly, or check with your compliance officer "
+                    "or the relevant policy owner directly."
+                ),
+                citations=[],
+                grounded=False,
+                mode="unavailable",
+            )
+        return AskResponse(answer=answer, citations=[], grounded=False, mode="general")
+
+    return AskResponse(
+        answer=(
+            "I couldn't find procedure documentation that clearly covers this "
+            "question. Please check with your compliance officer or the relevant "
+            "policy owner directly, or rephrase the question."
+        ),
+        citations=[],
+        grounded=False,
+        mode="unavailable",
+    )
 
 
 # Static assets (CSS/JS) for the templated pages below

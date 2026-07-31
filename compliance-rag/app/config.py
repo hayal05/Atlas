@@ -63,5 +63,33 @@ class Settings:
     # system says it doesn't have grounded coverage rather than guessing. ---
     MIN_RELEVANCE: float = float(os.getenv("MIN_RELEVANCE", "0.25"))
 
+    # --- Uploaded documents are always given first crack at answering a
+    # question. SOFT_RELEVANCE is a second, lower bar: chunks that don't
+    # clear MIN_RELEVANCE but do clear this are still a *document* match,
+    # just a weaker one, and are used in preference to the general-
+    # knowledge fallback below (mode: "grounded_partial"). Only when
+    # nothing clears even this bar does the assistant fall through to
+    # general knowledge (or refuse, if that's disabled). Must be <=
+    # MIN_RELEVANCE. ---
+    SOFT_RELEVANCE: float = float(os.getenv("SOFT_RELEVANCE", "0.12"))
+
+    # --- General Q&A fallback. When a question doesn't match any indexed
+    # procedure documents (score < MIN_RELEVANCE), the assistant can either
+    # (a) fall back to the model's general knowledge, clearly labeled as
+    # ungrounded, or (b) refuse and point the user at a human, as before.
+    # This calls the SAME external LLM host already configured above, so it
+    # adds no extra memory/process footprint on a free-tier web service --
+    # only an extra outbound HTTP call. Default on; set to "false" to
+    # restore the original strict, docs-only behavior. ---
+    ALLOW_GENERAL_QA: bool = os.getenv("ALLOW_GENERAL_QA", "true").strip().lower() in ("1", "true", "yes", "on")
+
+    # --- Caps below keep each request cheap and fast, which matters on
+    # Render's free tier: a single worker process, 512MB RAM, and a service
+    # that spins down after 15 minutes idle (so the first request after a
+    # cold start is already slow -- a hung or oversized LLM call on top of
+    # that can tie up the only worker and time out the request). ---
+    LLM_TIMEOUT_SECONDS: float = float(os.getenv("LLM_TIMEOUT_SECONDS", "20"))
+    LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", "600"))
+
 
 settings = Settings()
