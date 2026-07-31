@@ -26,9 +26,9 @@ _pool: ConnectionPool | None = None
 
 
 def _configure(conn: psycopg.Connection) -> None:
+    conn.autocommit = True
     conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
     register_vector(conn)
-    conn.autocommit = True
 
 
 def _probe_connection() -> None:
@@ -54,18 +54,14 @@ def _probe_connection() -> None:
         scheme, _, _ = creds.partition("://")
         masked = f"{scheme}://***:***@{rest}"
 
-    print(f"[db probe] connecting to {masked} ...", flush=True)
     try:
         with psycopg.connect(settings.DATABASE_URL, connect_timeout=10) as conn:
-            print("[db probe] connected, running CREATE EXTENSION ...", flush=True)
-            conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
-            print("[db probe] CREATE EXTENSION ok, running register_vector ...", flush=True)
-            register_vector(conn)
-            print("[db probe] register_vector ok, flipping autocommit ...", flush=True)
             conn.autocommit = True
-            print("[db probe] SUCCESS -- full configure path works", flush=True)
+            conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            register_vector(conn)
+        print(f"[db probe] connected OK to {masked}", flush=True)
     except Exception:
-        print("[db probe] FAILED -- this is the real cause:", flush=True)
+        print(f"[db probe] FAILED connecting to {masked}:", flush=True)
         print(traceback.format_exc(), flush=True)
         raise
 
