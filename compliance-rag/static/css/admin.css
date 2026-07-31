@@ -24,9 +24,9 @@ a.back { font-size: 13px; color: var(--accent-dark); text-decoration: none; }
 #gate button, .btn { font-family: var(--sans); font-weight: 600; font-size: 13.5px; background: var(--accent); color: #fff; border: none; border-radius: 8px; padding: 9px 16px; cursor: pointer; }
 #gate button:hover, .btn:hover { background: var(--accent-dark); }
 #gate button:disabled, .btn:disabled { opacity: 0.5; cursor: default; }
-#status-msg { font-size: 13px; margin-top: 8px; }
-#status-msg.error { color: var(--danger); }
-#status-msg.ok { color: var(--accent-dark); }
+.status-msg { font-size: 13px; margin-top: 8px; }
+.status-msg.error { color: var(--danger); }
+.status-msg.ok { color: var(--accent-dark); }
 
 #main { display: none; }
 .dropzone {
