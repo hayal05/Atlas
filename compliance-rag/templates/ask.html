@@ -4,38 +4,68 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Atlas AI · Procedure Compliance Assistant</title>
+<link rel="icon" type="image/png" href="{{ url_for('static', path='img/logo.png') }}" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Anta&display=swap" rel="stylesheet" />
 <link rel="stylesheet" href="{{ url_for('static', path='css/ask.css') }}" />
 </head>
 <body>
-<div class="wrap">
-  <header>
-    <div class="brand">
-      <svg width="26" height="26" viewBox="0 0 26 26" fill="none" xmlns="http://www.w3.org/2000/svg">
-        <circle cx="13" cy="13" r="12" stroke="#e8560c" stroke-width="1.6"/>
-        <path d="M13 5.5L15.3 11.7L21 13L15.3 14.3L13 20.5L10.7 14.3L5 13L10.7 11.7L13 5.5Z" fill="#e8560c"/>
-      </svg>
-      <span class="brand-name">Atlas<span> AI</span></span>
+<div class="app">
+
+  <button id="hamburger" class="hamburger" aria-label="Toggle chat history" aria-expanded="false">
+    <span></span><span></span><span></span>
+  </button>
+
+  <div id="overlay" class="overlay"></div>
+
+  <aside id="sidebar" class="sidebar">
+    <div class="sidebar-header">
+      <span class="sidebar-title">Chat history</span>
+      <button id="newChatBtn" class="new-chat-btn" type="button">+ New chat</button>
     </div>
-    <div class="eyebrow">Internal tool · not legal advice</div>
-    <h1>Procedure Compliance Assistant</h1>
-    <p>Ask a question about company procedure. Answers are grounded only in the
-    indexed policy documents, with citations to the relevant section.</p>
-  </header>
+    <div id="historyList" class="history-list"></div>
+    <div class="sidebar-footer">
+      <a href="/admin" class="sidebar-admin-link">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M12 15.5A3.5 3.5 0 1 0 12 8.5a3.5 3.5 0 0 0 0 7Z" stroke="currentColor" stroke-width="1.6"/>
+          <path d="M19.4 13.5a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V19.5a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1.08-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H4.5a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 6.1 8.6a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H10.5a1.65 1.65 0 0 0 1-1.51V4.5a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V10.5a1.65 1.65 0 0 0 1.51 1H19.5a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z" stroke="currentColor" stroke-width="1.6"/>
+        </svg>
+        Admin
+      </a>
+    </div>
+  </aside>
 
-  <div id="log">
-    <div class="empty">Try: "What receipts do I need for a $200 client dinner?"</div>
-  </div>
+  <div class="wrap">
+    <header>
+      <div class="brand">
+        <img src="{{ url_for('static', path='img/logo.png') }}" alt="Atlas AI logo" class="brand-logo" />
+        <span class="brand-name">Atlas<span> AI</span></span>
+      </div>
+      <div class="eyebrow">Internal tool · not legal advice</div>
+      <h1>Procedure Compliance Assistant</h1>
+      <p>Ask a question about company procedure. Answers grounded in the indexed
+      policy documents come with citations to the relevant section. Questions
+      outside those documents are still answered from general knowledge, clearly
+      labeled as such.</p>
+    </header>
 
-  <form id="form">
-    <textarea id="input" placeholder="Ask about a procedure..." rows="1"></textarea>
-    <button id="send" type="submit">Ask</button>
-  </form>
-  <div class="disclaimer">
-    This assistant summarizes documented procedure. For disciplinary matters,
-    legal questions, or anything ambiguous, contact your compliance officer.
-    &nbsp;·&nbsp; <a href="/admin" style="color:#93918a;">Admin</a>
+    <div id="log">
+      <div class="empty">Try: "What receipts do I need for a $200 client dinner?"</div>
+    </div>
+
+    <form id="form">
+      <textarea id="input" placeholder="Ask about a procedure..." rows="1"></textarea>
+      <button id="send" type="submit">Ask</button>
+    </form>
+    <div class="disclaimer">
+      This assistant summarizes documented procedure. For disciplinary matters,
+      legal questions, or anything ambiguous, contact your compliance officer.
+    </div>
   </div>
 </div>
+
+<footer class="site-footer">Developed by <strong>Hayelom Mengistu</strong> · © 2026</footer>
 
 <script src="{{ url_for('static', path='js/ask.js') }}"></script>
 </body>
