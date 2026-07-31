@@ -1,23 +1,28 @@
 """
 Ingestion + retrieval pipeline.
 
-Docs (markdown/txt/pdf/docx) in DOCS_DIR are split into heading-aware
-chunks, embedded locally with Chroma's built-in ONNX MiniLM embedding
-function (no torch/transformers dependency -- important for staying
-inside low-memory hosting tiers), and stored in a persistent Chroma
-collection. At query time we embed the question and pull back the
-top-K most similar chunks with their source citations.
+Docs (markdown/txt/pdf/docx) are stored in the Neon `documents` table,
+split into heading-aware chunks, embedded locally with Chroma's built-in
+ONNX MiniLM embedding function (no torch/transformers dependency --
+important for staying inside low-memory hosting tiers), and stored in
+the Neon `chunks` table alongside their pgvector embedding. At query
+time we embed the question and pull back the top-K most similar chunks
+with their source citations via a plain SQL ORDER BY on vector distance.
+
+Storing both the source documents and the vector index in Postgres
+(rather than on local disk) means everything survives a Render redeploy,
+restart, or move to a new instance -- Render's filesystem does not.
 """
-import glob
 import os
 import re
+import tempfile
 from dataclasses import dataclass
 from typing import List, Optional
 
-import chromadb
 from chromadb.utils import embedding_functions
 
 from app.config import settings
+from app.db import get_pool, init_schema
 from app.extract import extract_pages, ALLOWED_EXTENSIONS
 
 
@@ -73,167 +78,181 @@ def _chunk_section(body: str, size: int, overlap: int) -> List[str]:
     return chunks
 
 
-def load_and_chunk_documents(docs_dir: str) -> List[Chunk]:
+def _fetch_documents() -> List[tuple]:
+    """Returns (filename, content_bytes) for every document in the DB."""
+    with get_pool().connection() as conn:
+        return conn.execute(
+            "SELECT filename, content FROM documents ORDER BY filename"
+        ).fetchall()
+
+
+def load_and_chunk_documents() -> List[Chunk]:
+    """Pull every stored document out of Postgres, write each one to a
+    scratch temp dir just long enough to run the existing
+    extract-and-chunk logic (unchanged from the local-disk version), then
+    discard the temp files. The DB row is the only persistent copy."""
     chunks: List[Chunk] = []
-    paths = sorted(
-        p for p in glob.glob(os.path.join(docs_dir, "**", "*"), recursive=True)
-        if os.path.isfile(p) and os.path.splitext(p)[1].lower() in ALLOWED_EXTENSIONS
-    )
-    for path in paths:
-        try:
-            pages = extract_pages(path)
-        except Exception as e:
-            print(f"[ingest] skipping {path}: {e}")
-            continue
-        source_name = os.path.relpath(path, docs_dir)
-        chunk_number = 0  # 1-based position of a chunk within this source doc, for citations
-        for page_num, page_text in pages:
-            sections = _split_into_sections(page_text) or [("General", page_text)]
-            for heading, body in sections:
-                for piece in _chunk_section(body, settings.CHUNK_SIZE, settings.CHUNK_OVERLAP):
-                    piece = piece.strip()
-                    if not piece:
-                        continue
-                    chunk_number += 1
-                    chunks.append(
-                        Chunk(
-                            text=piece,
-                            source=source_name,
-                            heading=heading,
-                            chunk_id=f"{source_name}::p{page_num}::{heading}::{chunk_number}",
-                            page=page_num,
-                            chunk_number=chunk_number,
+    with tempfile.TemporaryDirectory() as tmp:
+        for filename, content in _fetch_documents():
+            if os.path.splitext(filename)[1].lower() not in ALLOWED_EXTENSIONS:
+                continue
+            path = os.path.join(tmp, filename)
+            with open(path, "wb") as f:
+                f.write(content)
+            try:
+                pages = extract_pages(path)
+            except Exception as e:
+                print(f"[ingest] skipping {filename}: {e}")
+                continue
+            chunk_number = 0  # 1-based position of a chunk within this source doc, for citations
+            for page_num, page_text in pages:
+                sections = _split_into_sections(page_text) or [("General", page_text)]
+                for heading, body in sections:
+                    for piece in _chunk_section(body, settings.CHUNK_SIZE, settings.CHUNK_OVERLAP):
+                        piece = piece.strip()
+                        if not piece:
+                            continue
+                        chunk_number += 1
+                        chunks.append(
+                            Chunk(
+                                text=piece,
+                                source=filename,
+                                heading=heading,
+                                chunk_id=f"{filename}::p{page_num}::{heading}::{chunk_number}",
+                                page=page_num,
+                                chunk_number=chunk_number,
+                            )
                         )
-                    )
     return chunks
 
 
 def ensure_docs_dir_seeded():
-    """On first boot, DOCS_DIR (the persistent, writable location) is
-    empty -- populate it from the read-only sample docs bundled with the
-    repo. Once anything exists there (including an admin having deleted
-    all the samples on purpose), this is a no-op."""
-    os.makedirs(settings.DOCS_DIR, exist_ok=True)
-    if os.listdir(settings.DOCS_DIR):
+    """On first boot, the `documents` table is empty -- populate it from
+    the read-only sample docs bundled with the repo. Once anything exists
+    in the table (including an admin having deleted all the samples on
+    purpose), this is a no-op: it never overwrites what's in the DB."""
+    with get_pool().connection() as conn:
+        (count,) = conn.execute("SELECT count(*) FROM documents").fetchone()
+    if count:
         return
     if not os.path.isdir(settings.SEED_DOCS_DIR):
         return
-    import shutil
-
-    for name in os.listdir(settings.SEED_DOCS_DIR):
+    for name in sorted(os.listdir(settings.SEED_DOCS_DIR)):
         src = os.path.join(settings.SEED_DOCS_DIR, name)
-        dst = os.path.join(settings.DOCS_DIR, name)
-        if os.path.isfile(src):
-            shutil.copyfile(src, dst)
+        if os.path.isfile(src) and os.path.splitext(name)[1].lower() in ALLOWED_EXTENSIONS:
+            with open(src, "rb") as f:
+                save_uploaded_document(name, f.read())
 
 
 def list_documents() -> List[dict]:
-    os.makedirs(settings.DOCS_DIR, exist_ok=True)
-    out = []
-    for name in sorted(os.listdir(settings.DOCS_DIR)):
-        path = os.path.join(settings.DOCS_DIR, name)
-        if os.path.isfile(path):
-            stat = os.stat(path)
-            out.append({"filename": name, "size_bytes": stat.st_size, "modified": stat.st_mtime})
-    return out
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT filename, size_bytes, uploaded_at FROM documents ORDER BY filename"
+        ).fetchall()
+    return [
+        {"filename": filename, "size_bytes": size_bytes, "modified": uploaded_at.timestamp()}
+        for filename, size_bytes, uploaded_at in rows
+    ]
 
 
 def save_uploaded_document(filename: str, content: bytes) -> str:
-    """Save an uploaded file's bytes into DOCS_DIR under a sanitized
-    filename. Returns the final filename used."""
+    """Save an uploaded file's bytes into the `documents` table under a
+    sanitized filename (overwriting any existing document with the same
+    name). Returns the final filename used."""
     base = os.path.basename(filename).strip()
     base = re.sub(r"[^A-Za-z0-9._ -]", "_", base)
     if not base or os.path.splitext(base)[1].lower() not in ALLOWED_EXTENSIONS:
         raise ValueError(f"Unsupported or invalid filename: {filename!r}")
 
-    os.makedirs(settings.DOCS_DIR, exist_ok=True)
-    dest = os.path.join(settings.DOCS_DIR, base)
-    with open(dest, "wb") as f:
-        f.write(content)
+    with get_pool().connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO documents (filename, content, size_bytes, uploaded_at)
+            VALUES (%s, %s, %s, now())
+            ON CONFLICT (filename) DO UPDATE
+                SET content = EXCLUDED.content,
+                    size_bytes = EXCLUDED.size_bytes,
+                    uploaded_at = now()
+            """,
+            (base, content, len(content)),
+        )
     return base
 
 
 def delete_document(filename: str) -> bool:
     base = os.path.basename(filename)
-    path = os.path.join(settings.DOCS_DIR, base)
-    if not os.path.isfile(path):
-        return False
-    os.remove(path)
-    return True
+    with get_pool().connection() as conn:
+        cur = conn.execute("DELETE FROM documents WHERE filename = %s", (base,))
+        return cur.rowcount > 0
 
 
 class ComplianceIndex:
     def __init__(self):
         self._embedder = embedding_functions.DefaultEmbeddingFunction()
-        self._client = chromadb.PersistentClient(path=settings.CHROMA_DIR)
-        self._collection = self._client.get_or_create_collection(
-            name=settings.COLLECTION_NAME,
-            embedding_function=self._embedder,
-            metadata={"hnsw:space": "cosine"},
-        )
+        init_schema()
 
-    def rebuild(self, docs_dir: str = None) -> int:
+    def rebuild(self) -> int:
         """Wipe and re-ingest all documents. Call this on startup and
         whenever procedure documents change."""
-        docs_dir = docs_dir or settings.DOCS_DIR
-        chunks = load_and_chunk_documents(docs_dir)
+        chunks = load_and_chunk_documents()
 
-        try:
-            self._client.delete_collection(settings.COLLECTION_NAME)
-        except Exception:
-            pass
-        self._collection = self._client.get_or_create_collection(
-            name=settings.COLLECTION_NAME,
-            embedding_function=self._embedder,
-            metadata={"hnsw:space": "cosine"},
-        )
-
-        if not chunks:
-            return 0
-
-        self._collection.add(
-            ids=[c.chunk_id for c in chunks],
-            documents=[c.text for c in chunks],
-            metadatas=[
-                {
-                    "source": c.source,
-                    "heading": c.heading,
-                    "chunk_number": c.chunk_number,
-                    # Chroma metadata can't store None, so use 0 as "no page"
-                    "page": c.page if c.page is not None else 0,
-                }
-                for c in chunks
-            ],
-        )
+        with get_pool().connection() as conn:
+            conn.execute("TRUNCATE TABLE chunks")
+            if chunks:
+                embeddings = self._embedder([c.text for c in chunks])
+                rows = [
+                    (c.chunk_id, c.source, c.heading, c.chunk_number, c.page, c.text, list(emb))
+                    for c, emb in zip(chunks, embeddings)
+                ]
+                with conn.cursor() as cur:
+                    cur.executemany(
+                        """
+                        INSERT INTO chunks
+                            (chunk_id, source, heading, chunk_number, page, text, embedding)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        rows,
+                    )
         return len(chunks)
 
     def count(self) -> int:
-        return self._collection.count()
+        with get_pool().connection() as conn:
+            (n,) = conn.execute("SELECT count(*) FROM chunks").fetchone()
+        return n
 
     def retrieve(self, query: str, top_k: int = None) -> List[RetrievedChunk]:
         top_k = top_k or settings.TOP_K
-        if self.count() == 0:
+        n = self.count()
+        if n == 0:
             return []
-        results = self._collection.query(query_texts=[query], n_results=min(top_k, self.count()))
+
+        query_embedding = list(self._embedder([query])[0])
+        with get_pool().connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT chunk_id, source, heading, chunk_number, page, text,
+                       embedding <=> %s AS distance
+                FROM chunks
+                ORDER BY distance
+                LIMIT %s
+                """,
+                (query_embedding, min(top_k, n)),
+            ).fetchall()
 
         out: List[RetrievedChunk] = []
-        docs = results["documents"][0]
-        metas = results["metadatas"][0]
-        dists = results["distances"][0]
-        ids = results["ids"][0]
-        for doc, meta, dist, cid in zip(docs, metas, dists, ids):
-            # Chroma cosine "distance" -> similarity score in [0, 1]
+        for chunk_id, source, heading, chunk_number, page, text, dist in rows:
+            # pgvector cosine distance is in [0, 2] (1 - cosine_similarity),
+            # same convention the old Chroma "cosine" space used.
             similarity = max(0.0, 1.0 - dist / 2.0)
-            page = meta.get("page") or None  # 0 was stored as "no page" -> None
             out.append(
                 RetrievedChunk(
                     chunk=Chunk(
-                        text=doc,
-                        source=meta["source"],
-                        heading=meta["heading"],
-                        chunk_id=cid,
+                        text=text,
+                        source=source,
+                        heading=heading,
+                        chunk_id=chunk_id,
                         page=page,
-                        chunk_number=meta.get("chunk_number", 0),
+                        chunk_number=chunk_number,
                     ),
                     score=similarity,
                 )

@@ -12,26 +12,19 @@ class Settings:
     # inside low-memory hosting tiers (that's what OOM-killed earlier
     # sentence-transformers-based deploys with exit status 137). ---
 
-    # --- Persistent storage root. On Render this is the mounted disk from
-    # render.yaml; locally it's a folder next to the code. Both the vector
-    # index AND the uploaded documents live under here, so admin uploads
-    # survive redeploys. ---
-    PERSIST_ROOT: str = os.getenv(
-        "PERSIST_ROOT", "/opt/render/project/data" if os.getenv("RENDER") else "./local_data"
-    )
-
-    # --- Vector store ---
-    CHROMA_DIR: str = os.getenv("CHROMA_DIR", os.path.join(PERSIST_ROOT, "chroma_db"))
-    COLLECTION_NAME: str = os.getenv("COLLECTION_NAME", "procedures")
-
-    # --- Source documents to ingest on startup. This is the WRITABLE,
-    # persistent location -- admin uploads land here. ---
-    DOCS_DIR: str = os.getenv("DOCS_DIR", os.path.join(PERSIST_ROOT, "docs"))
+    # --- Persistent storage: Neon Postgres. Both the uploaded documents
+    # AND the vector index (via pgvector) live in this database, so they
+    # survive redeploys, restarts, and moving to a new Render instance --
+    # unlike Render's local disk, which is wiped on redeploy. Get this
+    # connection string from the Neon console (Project -> Connect); set
+    # it in the Render dashboard (or .env locally). ---
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "")
 
     # --- Read-only sample documents bundled with the repo. Copied into
-    # DOCS_DIR on first boot only (if DOCS_DIR is empty), so the app has
-    # something to answer questions about out of the box, without
-    # overwriting anything an admin has since uploaded or deleted. ---
+    # the database on first boot only (if the `documents` table is
+    # empty), so the app has something to answer questions about out of
+    # the box, without overwriting anything an admin has since uploaded
+    # or deleted. ---
     SEED_DOCS_DIR: str = os.getenv("SEED_DOCS_DIR", "./data/docs")
 
     # --- Admin auth. Required to upload/delete documents or trigger a
@@ -60,8 +53,27 @@ class Settings:
     CHUNK_OVERLAP: int = int(os.getenv("CHUNK_OVERLAP", "150"))
 
     # --- Minimum similarity to trust a retrieved chunk. Below this, the
-    # system says it doesn't have grounded coverage rather than guessing. ---
-    MIN_RELEVANCE: float = float(os.getenv("MIN_RELEVANCE", "0.25"))
+    # system says it doesn't have grounded coverage rather than guessing.
+    #
+    # IMPORTANT -- this needs calibrating against your own embedding
+    # model + corpus, not left at a guessed default. Chroma's default
+    # ONNX MiniLM embeddings have a fairly high "noise floor": even a
+    # totally unrelated query (e.g. "What is Australia" against a
+    # travel-expense policy) can score ~0.50-0.52 similarity, not
+    # anywhere near 0. If MIN_RELEVANCE sits below that floor, EVERY
+    # question gets treated as a confident document match and general
+    # Q&A never triggers -- which is exactly what "hello"/"what is
+    # Australia" got misrouted by before this was raised.
+    #
+    # To calibrate for your own deployment: ask a couple of genuinely
+    # off-topic questions and a couple of genuinely on-topic ones, note
+    # the top_score the server logs for each (see the "ask:" log line in
+    # app/main.py), and set MIN_RELEVANCE comfortably above the
+    # off-topic scores and SOFT_RELEVANCE somewhere between the two
+    # clusters. The value below is a conservative starting point, not a
+    # verified-correct one -- override it via the MIN_RELEVANCE /
+    # SOFT_RELEVANCE env vars once you have real numbers. ---
+    MIN_RELEVANCE: float = float(os.getenv("MIN_RELEVANCE", "0.60"))
 
     # --- Uploaded documents are always given first crack at answering a
     # question. SOFT_RELEVANCE is a second, lower bar: chunks that don't
@@ -70,8 +82,9 @@ class Settings:
     # knowledge fallback below (mode: "grounded_partial"). Only when
     # nothing clears even this bar does the assistant fall through to
     # general knowledge (or refuse, if that's disabled). Must be <=
-    # MIN_RELEVANCE. ---
-    SOFT_RELEVANCE: float = float(os.getenv("SOFT_RELEVANCE", "0.12"))
+    # MIN_RELEVANCE. See the MIN_RELEVANCE comment above -- calibrate
+    # this the same way. ---
+    SOFT_RELEVANCE: float = float(os.getenv("SOFT_RELEVANCE", "0.55"))
 
     # --- General Q&A fallback. When a question doesn't match any indexed
     # procedure documents (score < MIN_RELEVANCE), the assistant can either

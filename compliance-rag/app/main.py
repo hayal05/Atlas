@@ -1,3 +1,4 @@
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Depends, Request
@@ -17,6 +18,14 @@ from app.rag import (
 )
 from app.llm import answer_question, answer_general_question
 
+logger = logging.getLogger("atlas_ai")
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(_handler)
+logger.setLevel(logging.INFO)
+logger.propagate = False
+
 templates = Jinja2Templates(directory="templates")
 
 
@@ -25,7 +34,7 @@ async def lifespan(app: FastAPI):
     ensure_docs_dir_seeded()
     # Build the vector index from the procedure documents on startup.
     n = index.rebuild()
-    print(f"[startup] Indexed {n} chunks from {settings.DOCS_DIR}")
+    print(f"[startup] Indexed {n} chunks from Neon Postgres")
     yield
 
 
@@ -56,9 +65,7 @@ class AskRequest(BaseModel):
 class Citation(BaseModel):
     source: str
     heading: str
-    relevance: float
     page: Optional[int] = None
-    chunk_number: int = 0
 
 
 class AskResponse(BaseModel):
@@ -114,22 +121,29 @@ def admin_delete_document(filename: str, _: None = Depends(require_admin)):
 
 @app.post("/api/admin/reindex")
 def admin_reindex(_: None = Depends(require_admin)):
-    """Re-ingest documents from DOCS_DIR without adding/removing any."""
+    """Re-ingest documents already stored in Neon, without adding/removing any."""
     n = index.rebuild()
     return {"indexed_chunks": n}
 
 
 def _citations_for(chunks) -> List[Citation]:
-    return [
-        Citation(
-            source=r.chunk.source,
-            heading=r.chunk.heading,
-            relevance=round(r.score, 3),
-            page=r.chunk.page,
-            chunk_number=r.chunk.chunk_number,
-        )
-        for r in chunks
-    ]
+    """What was actually cited: document, section, and page. Deduplicated
+    by (source, heading, page) rather than by underlying chunk, so two
+    chunks from the same section of the same document collapse into one
+    reference instead of showing twice. Internal retrieval bookkeeping
+    (chunk number, raw similarity score) stays out -- it's not meaningful
+    to someone reading the answer, and confidence is already conveyed at
+    the response level via `mode`."""
+    seen = set()
+    out: List[Citation] = []
+    for r in chunks:
+        c = r.chunk
+        key = (c.source, c.heading, c.page)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(Citation(source=c.source, heading=c.heading, page=c.page))
+    return out
 
 
 @app.post("/api/ask", response_model=AskResponse)
@@ -144,6 +158,12 @@ def ask(req: AskRequest):
     strong = [r for r in retrieved if r.score >= settings.MIN_RELEVANCE]
     weak = [r for r in retrieved if settings.SOFT_RELEVANCE <= r.score < settings.MIN_RELEVANCE]
 
+    top_score = retrieved[0].score if retrieved else None
+    logger.info(
+        "ask: question=%r top_score=%s strong=%d weak=%d",
+        req.question, f"{top_score:.3f}" if top_score is not None else None, len(strong), len(weak),
+    )
+
     if strong:
         answer = answer_question(req.question, strong)
         return AskResponse(answer=answer, citations=_citations_for(strong), grounded=True, mode="grounded")
@@ -156,9 +176,13 @@ def ask(req: AskRequest):
         try:
             answer = answer_general_question(req.question)
         except Exception:
-            # An LLM host hiccup (timeout, rate limit, etc.) shouldn't
-            # surface as a 500 -- fall back to the same honest refusal
-            # as when general Q&A is disabled.
+            # An LLM host hiccup (timeout, rate limit, bad key, wrong
+            # model name, etc.) shouldn't surface as a 500 to the user --
+            # fall back to the same honest refusal as when general Q&A is
+            # disabled. But DO log it: a bare silent catch here made past
+            # failures indistinguishable from "working as intended",
+            # which is exactly what made this hard to debug.
+            logger.exception("General Q&A call failed for question: %r", req.question)
             return AskResponse(
                 answer=(
                     "I couldn't find procedure documentation covering this question, "

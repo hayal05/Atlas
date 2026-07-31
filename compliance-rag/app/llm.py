@@ -61,33 +61,10 @@ def _build_context(chunks: List[RetrievedChunk]) -> str:
         c = rc.chunk
         location = f"page {c.page}, " if c.page is not None else ""
         parts.append(
-            f"--- Source: {c.source} | {location}Section: {c.heading} | "
-            f"content #{c.chunk_number} (relevance: {rc.score:.2f}) ---\n{c.text}"
+            f"--- Source: {c.source} | {location}Section: {c.heading} "
+            f"(relevance: {rc.score:.2f}) ---\n{c.text}"
         )
     return "\n\n".join(parts)
-
-
-def format_references(chunks: List[RetrievedChunk]) -> str:
-    """Deterministic reference footer listing document name, page number,
-    and content (chunk) number for every excerpt actually used -- built in
-    code rather than left to the model, so it can't be misquoted or
-    hallucinated. Appended to the bottom of grounded/partial answers."""
-    if not chunks:
-        return ""
-    lines = ["", "---", "**References**"]
-    # De-dupe in case retrieval returns the same chunk twice; keep order.
-    seen = set()
-    n = 0
-    for rc in chunks:
-        c = rc.chunk
-        key = (c.source, c.page, c.chunk_number)
-        if key in seen:
-            continue
-        seen.add(key)
-        n += 1
-        location = f"page {c.page}, " if c.page is not None else ""
-        lines.append(f"{n}. {c.source} — {location}§ {c.heading} (content #{c.chunk_number})")
-    return "\n".join(lines)
 
 
 def answer_question(question: str, chunks: List[RetrievedChunk], weak_match: bool = False) -> str:
@@ -129,7 +106,7 @@ Answer using only the excerpts above, with inline citations to document and sect
         ],
     )
     answer = response.choices[0].message.content
-    return answer + format_references(chunks)
+    return answer
 
 
 def answer_general_question(question: str) -> str:
