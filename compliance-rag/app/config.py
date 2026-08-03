@@ -6,11 +6,12 @@ import os
 
 
 class Settings:
-    # --- Embedding: Chroma's built-in ONNX MiniLM embedding function is used
-    # (see app/rag.py). It's fixed, not configurable here, deliberately --
-    # it has no torch/transformers dependency, which matters for staying
+    # --- Embedding: fastembed's ONNX all-MiniLM-L6-v2 model is used (see
+    # app/rag.py). It's fixed, not configurable here, deliberately -- it has
+    # no torch/transformers/chromadb dependency, which matters for staying
     # inside low-memory hosting tiers (that's what OOM-killed earlier
-    # sentence-transformers-based deploys with exit status 137). ---
+    # sentence-transformers-based deploys with exit status 137, and what
+    # chromadb's much larger client/server dependency tree risked too). ---
 
     # --- Persistent storage: Neon Postgres. Both the uploaded documents
     # AND the vector index (via pgvector) live in this database, so they

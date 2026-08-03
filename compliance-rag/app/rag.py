@@ -2,8 +2,8 @@
 Ingestion + retrieval pipeline.
 
 Docs (markdown/txt/pdf/docx) are stored in the Neon `documents` table,
-split into heading-aware chunks, embedded locally with Chroma's built-in
-ONNX MiniLM embedding function (no torch/transformers dependency --
+split into heading-aware chunks, embedded locally with fastembed's ONNX
+all-MiniLM-L6-v2 model (no torch/transformers/chromadb dependency --
 important for staying inside low-memory hosting tiers), and stored in
 the Neon `chunks` table alongside their pgvector embedding. At query
 time we embed the question and pull back the top-K most similar chunks
@@ -19,7 +19,7 @@ import tempfile
 from dataclasses import dataclass
 from typing import List, Optional
 
-from chromadb.utils import embedding_functions
+from fastembed import TextEmbedding
 
 from app.config import settings
 from app.db import get_pool, init_schema
@@ -40,6 +40,13 @@ class Chunk:
 class RetrievedChunk:
     chunk: Chunk
     score: float  # similarity, 0..1 (higher = more relevant)
+
+
+# How many chunks get embedded (and inserted into Postgres) per batch during
+# a rebuild. Keeping this bounded caps peak memory regardless of how many
+# documents/chunks exist -- important on low-memory hosting tiers, where
+# embedding thousands of chunks in a single call/insert can spike RSS.
+EMBED_BATCH_SIZE = 32
 
 
 def _split_into_sections(text: str) -> List[tuple]:
@@ -188,23 +195,38 @@ def delete_document(filename: str) -> bool:
 
 class ComplianceIndex:
     def __init__(self):
-        self._embedder = embedding_functions.DefaultEmbeddingFunction()
+        # fastembed runs the same ONNX all-MiniLM-L6-v2 model Chroma's
+        # DefaultEmbeddingFunction used (384-dim, matches EMBEDDING_DIM in
+        # app/db.py), but without pulling in chromadb's full client/server
+        # dependency tree (posthog telemetry, opentelemetry, kubernetes
+        # client, grpcio, etc). That import graph alone can add hundreds of
+        # MB of resident memory on process start -- easily enough to tip a
+        # 512MB Render instance into an OOM kill even before any request
+        # arrives, which is the most likely cause of memory-related
+        # suspensions on a low-memory plan.
+        self._embedder = TextEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2")
         init_schema()
+
+    def _embed(self, texts: List[str]) -> List[list]:
+        """Returns one embedding (as a plain list of floats) per input text."""
+        return [emb.tolist() for emb in self._embedder.embed(texts)]
 
     def rebuild(self) -> int:
         """Wipe and re-ingest all documents. Call this on startup and
-        whenever procedure documents change."""
+        whenever procedure documents change. Embeds and inserts in bounded
+        batches so peak memory doesn't scale with the total corpus size."""
         chunks = load_and_chunk_documents()
 
         with get_pool().connection() as conn:
             conn.execute("TRUNCATE TABLE chunks")
-            if chunks:
-                embeddings = self._embedder([c.text for c in chunks])
-                rows = [
-                    (c.chunk_id, c.source, c.heading, c.chunk_number, c.page, c.text, list(emb))
-                    for c, emb in zip(chunks, embeddings)
-                ]
-                with conn.cursor() as cur:
+            with conn.cursor() as cur:
+                for i in range(0, len(chunks), EMBED_BATCH_SIZE):
+                    batch = chunks[i : i + EMBED_BATCH_SIZE]
+                    embeddings = self._embed([c.text for c in batch])
+                    rows = [
+                        (c.chunk_id, c.source, c.heading, c.chunk_number, c.page, c.text, emb)
+                        for c, emb in zip(batch, embeddings)
+                    ]
                     cur.executemany(
                         """
                         INSERT INTO chunks
@@ -226,7 +248,7 @@ class ComplianceIndex:
         if n == 0:
             return []
 
-        query_embedding = list(self._embedder([query])[0])
+        query_embedding = self._embed([query])[0]
         with get_pool().connection() as conn:
             rows = conn.execute(
                 """
